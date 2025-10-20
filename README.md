@@ -1,6 +1,6 @@
 # 🎵 Sol-Aud(io)
 
-**Sol Records** is a proof-of-concept Solana dApp that uploads and plays back
+**Sol-Aud(io)** is a proof-of-concept Solana dApp that uploads and plays back
 **on-chain audio** — one chunked transaction at a time.  
 It uses a Pinocchio program and a Rust CLI for uploading and playback.
 

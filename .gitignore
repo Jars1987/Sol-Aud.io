@@ -1,0 +1,7 @@
+keypair.json
+target/
+Cargo.lock
+.DS_Store
+sol-record-player/target/
+sol-record/target//.git_backup_*
+target/

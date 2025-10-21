@@ -1,7 +1,7 @@
 pub mod audio;
 pub mod utils;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use futures::future::join_all;
 use hex::ToHex;
@@ -9,12 +9,14 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use std::{
     collections::{hash_map, HashMap},
+    io::Cursor,
     path::PathBuf,
     str::FromStr,
     time::Duration,
 };
 use tokio::time::sleep;
 use tracing_subscriber::{fmt, EnvFilter};
+use zstd::stream::{decode_all, encode_all};
 
 use sha2::{Digest, Sha256};
 use solana_sdk::{pubkey::Pubkey, signature::Signature, signer::Signer, transaction::Transaction};
@@ -140,11 +142,12 @@ impl UploadCmd {
         };
         let rpc = RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::confirmed());
 
-        tracing::info!(
-            "first payload head: {}",
-            &chunks[0].get(0..32).unwrap_or(&[]).encode_hex::<String>()
-        );
-        let total_chunks = chunks.len() as u32;
+        let compressed_chunks: Vec<Vec<u8>> = chunks
+            .into_iter()
+            .map(|c| encode_all(Cursor::new(c), 3).context("zstd compress chunk"))
+            .collect::<Result<_, _>>()?;
+
+        let total_chunks = compressed_chunks.len() as u32;
         let first_ix = build_write_ix(
             program_id,
             creator_pubkey,
@@ -156,15 +159,15 @@ impl UploadCmd {
             0,
             total_chunks,
             total_chunks == 1,
-            &chunks[0],
+            &compressed_chunks[0],
         );
 
         let mut first_tx = Transaction::new_with_payer(&[first_ix], Some(&creator_pubkey));
         let sig_0 = send_and_confirm_with_latest_blockhash(&rpc, &mut first_tx, &[&payer]).await?;
         tracing::info!("first chunk sent: {} (index 0/{})", sig_0, total_chunks - 1);
 
-        for (i, payload) in chunks.iter().enumerate().skip(1) {
-            let is_final = (i as u32) == total_chunks - 1;
+        for (i, payload) in compressed_chunks.iter().enumerate().skip(1) {
+            let is_final = i == compressed_chunks.len() - 1;
             tracing::info!(
                 "chunk {} len={}, head={}",
                 i,
@@ -172,9 +175,11 @@ impl UploadCmd {
                 payload.get(0..32).unwrap_or(&[]).encode_hex::<String>()
             );
 
+            let mut attempt = 0;
+
             // Retry loop
             loop {
-                let attempt = 1;
+                attempt += 1;
 
                 let ix = build_write_ix(
                     program_id,
@@ -226,11 +231,11 @@ impl UploadCmd {
             }
         }
 
-        // 7) Save manifest (pda, audio_id, signatures) to a local JSON (optional).
+        // Logging for tracking but we could save the manifest in to a JSON.
         tracing::info!(
             "Upload (stub) — input={:?}, name={}, pda={}, max_chunk={}, dry_run={}",
             self.input,
-            self.name.unwrap(),
+            self.name.unwrap_or("unnamed".to_string()),
             record_pda.to_string(),
             self.max_chunk,
             self.dry_run
@@ -373,15 +378,21 @@ impl PlayCmd {
         }
 
         // Build ordered PCM buffer
-        let mut ordered = Vec::with_capacity(total_chunks_found);
+        let mut ordered_compressed_chunks = Vec::with_capacity(total_chunks_found);
         for i in 0..(total_chunks_found as u32) {
             if let Some(data) = chunks_map.remove(&i) {
-                ordered.push(data);
+                ordered_compressed_chunks.push(data);
             } else {
                 return Err(anyhow!("Missing chunk: {}.", i));
             }
         }
-        let pcm_bytes: Vec<u8> = ordered.into_iter().flatten().collect();
+
+        let mut pcm_bytes = Vec::new();
+        for (i, chunk) in ordered_compressed_chunks.iter().enumerate() {
+            let decompressed = decode_all(Cursor::new(&chunk))
+                .with_context(|| format!("zstd decompress chunk {}", i))?;
+            pcm_bytes.extend_from_slice(&decompressed);
+        }
 
         let audio_name = String::from_utf8_lossy(&final_chunk.name)
             .trim_matches(char::from(0))
@@ -405,6 +416,12 @@ impl PlayCmd {
 #[cfg(test)]
 mod real_file_tests {
     use std::path::{Path, PathBuf};
+
+    use std::io::Cursor;
+    use zstd::stream::{decode_all, encode_all};
+
+    // Pull functions from the audio module explicitly.
+    use crate::audio::{chunk_pcm_aligned, decode_audio};
 
     /// Resolve a file relative to the crate root (where Cargo.toml lives).
     fn root_file(rel: &str) -> PathBuf {
@@ -431,8 +448,7 @@ mod real_file_tests {
         );
 
         // Decode input with symphonia -> PCM bytes
-        let (pcm_bytes, sample_rate, channels) =
-            super::decode_audio(&PathBuf::from(&path)).expect("decode_audio failed");
+        let (pcm_bytes, sample_rate, channels) = decode_audio(&path).expect("decode_audio failed");
 
         println!(
             "decoded: samples(bytes)={}, sample_rate={}Hz, channels={}",
@@ -448,7 +464,7 @@ mod real_file_tests {
 
         // Chunk payloads (<= max_chunk), keeping frame alignment
         let max_chunk = 750usize;
-        let chunks = super::chunk_pcm_aligned(&pcm_bytes, channels, max_chunk);
+        let chunks = chunk_pcm_aligned(&pcm_bytes, channels, max_chunk);
 
         // Mirror your runtime log
         let first_lens: Vec<usize> = chunks.iter().take(5).map(|c| c.len()).collect();
@@ -456,7 +472,7 @@ mod real_file_tests {
 
         // Assertions: non-empty, each chunk <= max_chunk and aligned to frame size
         assert!(!chunks.is_empty(), "No chunks produced");
-        let bytes_per_frame = (channels as usize) * 2;
+        let bytes_per_frame = (channels as usize) * 2; // i16 per channel
         for (i, c) in chunks.iter().enumerate() {
             assert!(
                 c.len() <= max_chunk,
@@ -474,17 +490,16 @@ mod real_file_tests {
         }
 
         // Reassemble and compare exactly with input bytes (chunker must be lossless)
-        let reassembled: Vec<u8> = chunks.iter().flat_map(|c| c.clone()).collect();
+        let reassembled: Vec<u8> = chunks.concat();
         assert_eq!(
             reassembled, pcm_bytes,
             "Reassembled bytes differ from original PCM"
         );
 
-        // Optional: print first-non-zero frame indices for quick visual sanity
+        // Print first-non-zero frame indices for quick visual sanity
         let first_pcm_nz = pcm_bytes
             .chunks_exact(2)
             .position(|b| b != [0, 0])
-            .map(|i| i)
             .unwrap_or(usize::MAX);
         println!("first_non_zero_frame_in_pcm={}", first_pcm_nz);
 
@@ -495,5 +510,75 @@ mod real_file_tests {
                 .unwrap_or(usize::MAX);
             println!("chunk[{i}] len={}, first_non_zero_frame={}", c.len(), nz);
         }
+    }
+
+    #[test]
+    fn decode_chunk_and_roundtrip_zstd() {
+        let path = fixture_path();
+        assert!(
+            path.exists(),
+            "Test audio not found at {:?}. Put a file there or set AUDIO_FIXTURE=path",
+            path
+        );
+
+        // Decode → PCM
+        let (pcm_bytes, sample_rate, channels) = decode_audio(&path).expect("decode_audio failed");
+        assert!(!pcm_bytes.is_empty(), "PCM output is empty");
+
+        // Chunk PCM with frame alignment
+        let max_chunk = 750usize;
+        let chunks = chunk_pcm_aligned(&pcm_bytes, channels, max_chunk);
+        assert!(!chunks.is_empty(), "No chunks produced");
+
+        let bytes_per_frame = (channels as usize) * 2; // i16 per channel
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(
+                c.len() <= max_chunk,
+                "chunk[{i}] len {} exceeds max_chunk {}",
+                c.len(),
+                max_chunk
+            );
+            assert_eq!(
+                c.len() % bytes_per_frame,
+                0,
+                "chunk[{i}] not frame-aligned ({} % {} != 0)",
+                c.len(),
+                bytes_per_frame
+            );
+        }
+
+        // Compress each chunk independently (zstd level 3)
+        let compressed: Vec<Vec<u8>> = chunks
+            .iter()
+            .map(|c| encode_all(Cursor::new(c), 3).expect("zstd encode chunk"))
+            .collect();
+
+        // Decompress each chunk and reassemble
+        let mut roundtrip_pcm = Vec::with_capacity(pcm_bytes.len());
+        for (i, cc) in compressed.iter().enumerate() {
+            let dec = decode_all(Cursor::new(cc)).expect("zstd decode chunk");
+            assert_eq!(
+                dec.len() % bytes_per_frame,
+                0,
+                "decompressed chunk[{i}] not frame-aligned"
+            );
+            roundtrip_pcm.extend_from_slice(&dec);
+        }
+
+        // Exact match with original PCM
+        assert_eq!(
+            roundtrip_pcm, pcm_bytes,
+            "Round-trip (zstd per-chunk) differs from original PCM"
+        );
+
+        let total_compressed: usize = compressed.iter().map(|c| c.len()).sum();
+        println!(
+            "zstd per-chunk roundtrip ok — sample_rate={}Hz, channels={}, original={} bytes, compressed={} bytes ({:.2}x)",
+            sample_rate,
+            channels,
+            pcm_bytes.len(),
+            total_compressed,
+            (pcm_bytes.len() as f64) / (total_compressed as f64)
+        );
     }
 }
